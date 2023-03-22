@@ -7,8 +7,11 @@ logging.set_verbosity_error()
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import cv2
 
 import time
+import argparse
+import matplotlib.pyplot as plt
 
 
 from torch.cuda.amp import custom_bwd, custom_fwd 
@@ -134,12 +137,14 @@ class StableDiffusion(nn.Module):
 
         # since we omitted an item in grad, we need to use the custom function to specify the gradient
         # _t = time.time()
+
         latents.backward(gradient=grad, retain_graph=True)
+        
         # print(latents.grad)
         # loss = SpecifyGradient.apply(latents, grad) 
         # torch.cuda.synchronize(); print(f'[TIME] guiding: backward {time.time() - _t:.4f}s')
 
-        return t, grad, grad.pow(2).sum().sqrt() 
+        return grad.pow(2).sum().sqrt() 
 
     def produce_latents(self, text_embeddings, height=512, width=512, num_inference_steps=50, guidance_scale=7.5, latents=None):
 
@@ -155,7 +160,7 @@ class StableDiffusion(nn.Module):
 
                 # predict the noise residual
                 with torch.no_grad():
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
+                    noise_pred = self.unet(latent_model_input.to("cuda:2"), t, encoder_hidden_states=text_embeddings.to("cuda:2"))['sample']
 
                 # perform guidance
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -171,7 +176,7 @@ class StableDiffusion(nn.Module):
         latents = 1 / 0.18215 * latents
 
         with torch.no_grad():
-            imgs = self.vae.decode(latents).sample
+            imgs = self.vae.decode(latents.to("cuda:1")).sample
 
         imgs = (imgs / 2 + 0.5).clamp(0, 1)
         
@@ -213,14 +218,10 @@ class StableDiffusion(nn.Module):
 
 
 if __name__ == '__main__':
-
-    import argparse
-    import matplotlib.pyplot as plt
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('prompt', type=str)
+    parser.add_argument('--prompt', type=str)
     parser.add_argument('--negative', default='', type=str)
-    parser.add_argument('--sd_version', type=str, default='2.0', choices=['1.5', '2.0'], help="stable diffusion version")
+    parser.add_argument('--sd_version', type=str, default='2.1', choices=['1.5', '2.0', '2.1'], help="stable diffusion version")
     parser.add_argument('-H', type=int, default=512)
     parser.add_argument('-W', type=int, default=512)
     parser.add_argument('--seed', type=int, default=0)
@@ -229,15 +230,20 @@ if __name__ == '__main__':
 
     seed_everything(opt.seed)
 
-    device = torch.device('cuda')
+    device = torch.device('cuda:2')
 
     sd = StableDiffusion(device, opt.sd_version)
+    opt.prompt = 'newspaper'
 
     imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
 
     # visualize image
-    plt.imshow(imgs[0])
-    plt.show()
+
+    
+    # plt.imshow(imgs[0])
+    # plt.savefig('sd_output.png')
+    cv2.imwrite('sd_output.png', imgs[0])
+    # plt.show()
 
 
 
