@@ -1,52 +1,53 @@
 from transformers import CLIPTextModel, CLIPTokenizer, logging
-from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler
-
+from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline
+from diffusers.utils.import_utils import is_xformers_available
+from os.path import isfile
+from util import seed_everything
 # suppress partial model loading warning
 logging.set_verbosity_error()
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import cv2
+import cv2 
+from torch.cuda.amp import custom_bwd, custom_fwd
+from dataclasses import dataclass
 
-import time
-import argparse
-import matplotlib.pyplot as plt
-
-
-from torch.cuda.amp import custom_bwd, custom_fwd 
 
 class SpecifyGradient(torch.autograd.Function):
     @staticmethod
     @custom_fwd
     def forward(ctx, input_tensor, gt_grad):
-        ctx.save_for_backward(gt_grad) 
-        
-        # dummy loss value
-        return torch.zeros([1], device=input_tensor.device, dtype=input_tensor.dtype)
+        ctx.save_for_backward(gt_grad)
+        # we return a dummy value 1, which will be scaled by amp's scaler so we get the scale in backward.
+        return torch.ones([1], device=input_tensor.device, dtype=input_tensor.dtype)
 
     @staticmethod
     @custom_bwd
-    def backward(ctx, grad):
+    def backward(ctx, grad_scale):
         gt_grad, = ctx.saved_tensors
-        batch_size = len(gt_grad)
-        return gt_grad / batch_size, None
+        gt_grad = gt_grad * grad_scale
+        return gt_grad, None
 
-def seed_everything(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    #torch.backends.cudnn.deterministic = True
-    #torch.backends.cudnn.benchmark = True
+# def seed_everything(seed):
+#     torch.manual_seed(seed)
+#     torch.cuda.manual_seed(seed)
+#     #torch.backends.cudnn.deterministic = True
+#     #torch.backends.cudnn.benchmark = True
+
+@dataclass
+class UNet2DConditionOutput:
+    sample: torch.HalfTensor # Not sure how to check what unet_traced.pt contains, and user wants. HalfTensor or FloatTensor
 
 class StableDiffusion(nn.Module):
-    def __init__(self, device, sd_version='2.1', hf_key=None):
+    def __init__(self, device, vram_O=0, sd_version='2.1', hf_key=None):
         super().__init__()
 
         self.device = device
         self.sd_version = sd_version
 
         print(f'[INFO] loading stable diffusion...')
-        
+
         if hf_key is not None:
             print(f'[INFO] using hugging face custom model key: {hf_key}')
             model_key = hf_key
@@ -59,14 +60,38 @@ class StableDiffusion(nn.Module):
         else:
             raise ValueError(f'Stable-diffusion version {self.sd_version} not supported.')
 
+        precision_t = torch.float16 if vram_O else torch.float32
+
         # Create model
-        self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to("cuda:1")
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder").to("cuda:1")
-        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to("cuda:2")
-        
-        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
-        # self.scheduler = PNDMScheduler.from_pretrained(model_key, subfolder="scheduler")
+        pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=precision_t)
+        if isfile('./unet_traced.pt'):
+            # use jitted unet
+            unet_traced = torch.jit.load('./unet_traced.pt')
+            class TracedUNet(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.in_channels = pipe.unet.in_channels
+                    self.device = pipe.unet.device
+
+                def forward(self, latent_model_input, t, encoder_hidden_states):
+                    sample = unet_traced(latent_model_input, t, encoder_hidden_states)[0]
+                    return UNet2DConditionOutput(sample=sample)
+            pipe.unet = TracedUNet()
+        if vram_O:
+            pipe.enable_sequential_cpu_offload()
+            pipe.enable_vae_slicing()
+            pipe.unet.to(memory_format=torch.channels_last)
+            pipe.enable_attention_slicing(1)
+        else:
+            if is_xformers_available():
+                pipe.enable_xformers_memory_efficient_attention()
+
+        self.vae = pipe.vae.to(self.device)
+        self.tokenizer = pipe.tokenizer
+        self.text_encoder = pipe.text_encoder.to(self.device)
+        self.unet = pipe.unet.to(self.device)
+
+        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=precision_t)
 
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
         self.min_step = int(self.num_train_timesteps * 0.02)
@@ -82,13 +107,13 @@ class StableDiffusion(nn.Module):
         text_input = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length, truncation=True, return_tensors='pt')
 
         with torch.no_grad():
-            text_embeddings = self.text_encoder(text_input.input_ids.to("cuda:1"))[0]
+            text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
 
         # Do the same for unconditional embeddings
         uncond_input = self.tokenizer(negative_prompt, padding='max_length', max_length=self.tokenizer.model_max_length, return_tensors='pt')
 
         with torch.no_grad():
-            uncond_embeddings = self.text_encoder(uncond_input.input_ids.to("cuda:1"))[0]
+            uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
 
         # Cat for final embeddings
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
@@ -99,35 +124,33 @@ class StableDiffusion(nn.Module):
         
         # interp to 512x512 to be fed into vae.
 
-        # _t = time.time()
-        pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False).to('cuda:1')
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: interp {time.time() - _t:.4f}s')
+        pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False)
 
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
         t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
 
         # encode image into latents with vae, requires grad!
-        # _t = time.time()
-        latents = self.encode_imgs(pred_rgb_512).to("cuda:2")
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: vae enc {time.time() - _t:.4f}s')
+        latents = self.encode_imgs(pred_rgb_512)
 
         # predict the noise residual with unet, NO grad!
-        # _t = time.time()
         with torch.no_grad():
             # add noise
-            noise = torch.randn_like(latents).to("cuda:2")
+            noise = torch.randn_like(latents)
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 2)
-            noise_pred = self.unet(latent_model_input.to("cuda:2"), t.to("cuda:2"), encoder_hidden_states=text_embeddings.to("cuda:2")).sample
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: unet {time.time() - _t:.4f}s')
+            # Save input tensors for UNet
+            #torch.save(latent_model_input, "train_latent_model_input.pt")
+            #torch.save(t, "train_t.pt")
+            #torch.save(text_embeddings, "train_text_embeddings.pt")
+            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
         # perform guidance (high scale from paper!)
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
         # w(t), sigma_t^2
-        w = (1 - self.alphas[t]).to("cuda:2")
+        w = (1 - self.alphas[t])
         # w = self.alphas[t] ** 0.5 * (1 - self.alphas[t])
         grad = w * (noise_pred - noise)
 
@@ -136,15 +159,9 @@ class StableDiffusion(nn.Module):
         grad = torch.nan_to_num(grad)
 
         # since we omitted an item in grad, we need to use the custom function to specify the gradient
-        # _t = time.time()
+        loss = SpecifyGradient.apply(latents, grad)
 
-        latents.backward(gradient=grad, retain_graph=True)
-        
-        # print(latents.grad)
-        # loss = SpecifyGradient.apply(latents, grad) 
-        # torch.cuda.synchronize(); print(f'[TIME] guiding: backward {time.time() - _t:.4f}s')
-
-        return grad.pow(2).sum().sqrt() 
+        return loss 
 
     def produce_latents(self, text_embeddings, height=512, width=512, num_inference_steps=50, guidance_scale=7.5, latents=None):
 
@@ -158,9 +175,13 @@ class StableDiffusion(nn.Module):
                 # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
                 latent_model_input = torch.cat([latents] * 2)
 
+                # Save input tensors for UNet
+                #torch.save(latent_model_input, "produce_latents_latent_model_input.pt")
+                #torch.save(t, "produce_latents_t.pt")
+                #torch.save(text_embeddings, "produce_latents_text_embeddings.pt")
                 # predict the noise residual
                 with torch.no_grad():
-                    noise_pred = self.unet(latent_model_input.to("cuda:2"), t, encoder_hidden_states=text_embeddings.to("cuda:2"))['sample']
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
 
                 # perform guidance
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -176,7 +197,7 @@ class StableDiffusion(nn.Module):
         latents = 1 / 0.18215 * latents
 
         with torch.no_grad():
-            imgs = self.vae.decode(latents.to("cuda:1")).sample
+            imgs = self.vae.decode(latents).sample
 
         imgs = (imgs / 2 + 0.5).clamp(0, 1)
         
@@ -186,7 +207,6 @@ class StableDiffusion(nn.Module):
         # imgs: [B, 3, H, W]
 
         imgs = 2 * imgs - 1
-        imgs = imgs.to("cuda:1")
 
         posterior = self.vae.encode(imgs).latent_dist
         latents = posterior.sample() * 0.18215
@@ -218,10 +238,16 @@ class StableDiffusion(nn.Module):
 
 
 if __name__ == '__main__':
+
+    import argparse
+    import matplotlib.pyplot as plt
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--prompt', type=str)
+    parser.add_argument('prompt', type=str)
     parser.add_argument('--negative', default='', type=str)
     parser.add_argument('--sd_version', type=str, default='2.1', choices=['1.5', '2.0', '2.1'], help="stable diffusion version")
+    parser.add_argument('--hf_key', type=str, default=None, help="hugging face Stable diffusion model key")
+    parser.add_argument('--vram_O', type=int, default=0, choices=[0, 1, 2], help="VRAM optimization level for configuring Stable Diffusion")
     parser.add_argument('-H', type=int, default=512)
     parser.add_argument('-W', type=int, default=512)
     parser.add_argument('--seed', type=int, default=0)
@@ -230,20 +256,17 @@ if __name__ == '__main__':
 
     seed_everything(opt.seed)
 
-    device = torch.device('cuda:2')
+    device = torch.device('cuda')
 
-    sd = StableDiffusion(device, opt.sd_version)
-    opt.prompt = 'newspaper'
+    sd = StableDiffusion(device, opt.vram_O, opt.sd_version, opt.hf_key)
 
     imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
 
     # visualize image
-
-    
+    cv2.imwrite('flower.jpg', imgs[0])
     # plt.imshow(imgs[0])
-    # plt.savefig('sd_output.png')
-    cv2.imwrite('sd_output.jpg', imgs[0])
     # plt.show()
+
 
 
 
