@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 
 
 from torch.cuda.amp import custom_bwd, custom_fwd 
+from util import seed_everything
 
 class SpecifyGradient(torch.autograd.Function):
     @staticmethod
@@ -32,11 +33,11 @@ class SpecifyGradient(torch.autograd.Function):
         batch_size = len(gt_grad)
         return gt_grad / batch_size, None
 
-def seed_everything(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    #torch.backends.cudnn.deterministic = True
-    #torch.backends.cudnn.benchmark = True
+# def seed_everything(seed):
+#     torch.manual_seed(seed)
+#     torch.cuda.manual_seed(seed)
+#     #torch.backends.cudnn.deterministic = True
+#     #torch.backends.cudnn.benchmark = True
 
 class StableDiffusion(nn.Module):
     def __init__(self, device, sd_version='2.1', hf_key=None):
@@ -132,7 +133,9 @@ class StableDiffusion(nn.Module):
         grad = w * (noise_pred - noise)
 
         # clip grad for stable training?
-        # grad = grad.clamp(-10, 10)
+        # print(grad.max())
+        # print(grad.min())
+        grad = grad.clamp(-10, 10)
         grad = torch.nan_to_num(grad)
 
         # since we omitted an item in grad, we need to use the custom function to specify the gradient
@@ -228,12 +231,12 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=50)
     opt = parser.parse_args()
 
-    seed_everything(opt.seed)
+    seed_everything(42)
 
     device = torch.device('cuda:2')
 
     sd = StableDiffusion(device, opt.sd_version)
-    opt.prompt = 'newspaper'
+    opt.prompt = 'a newspaper with title at the top'
 
     imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
 
@@ -242,7 +245,7 @@ if __name__ == '__main__':
     
     # plt.imshow(imgs[0])
     # plt.savefig('sd_output.png')
-    cv2.imwrite('sd_output.png', imgs[0])
+    cv2.imwrite('sd_output42.png', imgs[0])
     # plt.show()
 
 
