@@ -1,5 +1,5 @@
-prompt="a white background with a newspaper title at the top of the canvas"
-bg_img="img/newspaper_empty_bg.jpg"
-src_img="img/newspaper_title.jpg"
+prompt="a dark theme poster with a hamburger on the wooden table"
+bg_img="img/hamburger_bg.jpg"
+src_img="img/hamburger.jpg"
 workspace="trail/exp3"
 python3 main.py --bg_img $bg_img --src_img $src_img --prompt "$prompt" --workspace $workspace

@@ -34,7 +34,7 @@ class DiffComposition(nn.Module): # differenable paste input img onto bg image
         grid = F.affine_grid(trans_param, self.output_size).to(self.device)
 
         src_mask = torch.ones(src_img.shape).to(self.device)
-        src_img_transform = F.grid_sample(src_img, grid)
+        src_img_transform = F.grid_sample(src_img, grid.to(src_img.dtype))
         src_mask_transform = F.grid_sample(src_mask, grid)
         src_mask_transform_complement = 1 - src_mask_transform
 
